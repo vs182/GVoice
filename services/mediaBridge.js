@@ -40,6 +40,14 @@ const DEFAULT_SYSTEM_INSTRUCTION =
 // Media Streams protocol guarantees a `stop` event always arrives promptly.
 const MAX_SESSION_MS = 10 * 60 * 1000;
 
+// Safety net for automatic VAD going quiet mid-call (observed live on this
+// preview model: real caller audio kept flowing in for 24+ seconds with
+// zero response — no audio, no turnComplete, nothing — until the caller
+// gave up). If Gemini hasn't produced anything in this long, proactively
+// nudge it to check in rather than let the call sit in dead silence.
+const SILENCE_NUDGE_MS  = 12_000;
+const WATCHDOG_TICK_MS  = 4_000;
+
 export function attachMediaStreamServer(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: '/media-stream' });
 
@@ -63,6 +71,8 @@ async function handleConnection(twilioWs) {
   let starting      = false; // true while verifying + opening Gemini session
   let pendingIn     = [];    // caller audio queued until Gemini session is ready
   let sessionTimer  = null;
+  let watchdogTimer = null;
+  let lastActivityAt = null; // last time Gemini actually produced audio
   let closed        = false;
 
   // TEMPORARY instrumentation to locate a "connects fine, caller hears
@@ -93,6 +103,7 @@ async function handleConnection(twilioWs) {
     if (closed) return;
     closed = true;
     if (sessionTimer) clearTimeout(sessionTimer);
+    if (watchdogTimer) clearInterval(watchdogTimer);
     if (geminiSession) geminiSession.close();
     try { twilioWs.close(); } catch (_) {}
     console.log('[media-stream] cleaned up, streamSid:', streamSid);
@@ -115,6 +126,7 @@ async function handleConnection(twilioWs) {
       systemInstruction: p.prompt || DEFAULT_SYSTEM_INSTRUCTION,
       onAudio: (base64Pcm24k) => {
         geminiAudioChunks++;
+        lastActivityAt = Date.now();
         console.log('[media-stream] audio chunk from Gemini #', geminiAudioChunks, 'bytes:', Buffer.from(base64Pcm24k, 'base64').length);
         const mulawPayload = geminiPcm16ToTwilioPayload(base64Pcm24k);
         const mulawBuffer  = Buffer.from(mulawPayload, 'base64');
@@ -133,8 +145,9 @@ async function handleConnection(twilioWs) {
 
     if (closed) { geminiSession.close(); return; } // cleanup() ran while we were awaiting connect()
 
-    geminiReady = true;
-    starting    = false;
+    geminiReady    = true;
+    starting       = false;
+    lastActivityAt = Date.now(); // starts the silence clock from session-open, giving the greeting a fair window
 
     if (pendingIn.length) {
       pendingIn.forEach((payload) => geminiSession.sendAudio(twilioPayloadToGeminiPcm16(payload)));
@@ -145,6 +158,16 @@ async function handleConnection(twilioWs) {
       console.warn('[media-stream] max session duration reached, closing:', streamSid);
       cleanup();
     }, MAX_SESSION_MS);
+
+    watchdogTimer = setInterval(() => {
+      if (closed || !lastActivityAt) return;
+      const silentFor = Date.now() - lastActivityAt;
+      if (silentFor >= SILENCE_NUDGE_MS) {
+        console.warn('[media-stream] no Gemini activity for', silentFor, 'ms — sending recovery nudge, streamSid:', streamSid);
+        geminiSession.sendNudge('There has been a long pause on the call. Politely check in — ask if the caller is still there or if they need anything else.');
+        lastActivityAt = Date.now(); // don't nudge again every tick while still waiting on this one
+      }
+    }, WATCHDOG_TICK_MS);
   }
 
   twilioWs.on('message', (raw) => {

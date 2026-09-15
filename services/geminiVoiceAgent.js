@@ -131,6 +131,21 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         console.warn('[gemini] sendAudio failed:', err.message ?? err);
       }
     },
+    // Explicit text turn — same mechanism as the initial greeting above.
+    // Used as a recovery nudge when automatic VAD goes quiet for too long
+    // mid-call (observed live on this preview model: real audio kept
+    // flowing in but the server produced nothing at all — no audio, no
+    // turnComplete, nothing — for 24+ seconds until the caller gave up and
+    // hung up). Not a fix for whatever causes VAD to stop reacting, but a
+    // safety net so a stuck session doesn't just sit in dead silence.
+    sendNudge(text) {
+      if (closed) return;
+      try {
+        session.sendClientContent({ turns: text });
+      } catch (err) {
+        console.warn('[gemini] sendNudge failed:', err.message ?? err);
+      }
+    },
     close() {
       if (closed) return;
       closed = true;
