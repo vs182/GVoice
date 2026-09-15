@@ -1,0 +1,18 @@
+{
+  "name": "voice-hub-media-stream-service",
+  "version": "1.0.0",
+  "description": "Standalone WebSocket bridge: Twilio Media Streams <-> Gemini Live API. Deployed separately from the main Catalyst-hosted app because Catalyst's gateway doesn't pass WebSocket upgrades through to AppSail.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@google/genai": "^2.22.0",
+    "ws": "^8.21.3"
+  }
+}
