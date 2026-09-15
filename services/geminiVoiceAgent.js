@@ -48,11 +48,16 @@ function getClient() {
  *   audio chunk, still in Gemini's native 24kHz PCM16 — callers resample.
  * @param {() => void} opts.onInterrupted — caller barged in; stop/flush
  *   whatever's currently queued for playback.
+ * @param {() => void} [opts.onTurnComplete] — fires whenever a model turn
+ *   finishes (the greeting, a nudge, a normal reply — every one). Callers
+ *   typically only care about the FIRST one, to know when it's safe to
+ *   start forwarding live caller audio without risking an interrupt firing
+ *   on a turn that hasn't produced any audio yet — see mediaBridge.js.
  * @param {(err: Error) => void} opts.onError
  * @param {() => void} [opts.onClose]
  * @returns {Promise<{ sendAudio: (base64Pcm16k: string) => void, close: () => void }>}
  */
-export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onError, onClose }) {
+export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onError, onClose }) {
   const ai = getClient();
   let closed = false;
 
@@ -92,6 +97,7 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         for (const part of audioParts) {
           onAudio?.(part.inlineData.data);
         }
+        if (content.turnComplete) onTurnComplete?.();
       },
       onerror: (err) => {
         console.error('[gemini] session error:', err?.message ?? err);

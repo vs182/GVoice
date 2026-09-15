@@ -69,7 +69,8 @@ async function handleConnection(twilioWs) {
   let geminiSession = null;
   let geminiReady   = false;
   let starting      = false; // true while verifying + opening Gemini session
-  let pendingIn     = [];    // caller audio queued until Gemini session is ready
+  let greetingSettled = false; // true once the greeting's first turn completes
+  let pendingIn     = [];    // caller audio queued until it's safe to forward
   let sessionTimer  = null;
   let watchdogTimer = null;
   let lastActivityAt = null; // last time Gemini actually produced audio
@@ -136,6 +137,15 @@ async function handleConnection(twilioWs) {
         // Caller barged in — stop whatever Twilio still has queued for playback.
         clearTwilioPlayback();
       },
+      onTurnComplete: () => {
+        if (greetingSettled) return; // only care about the very first one
+        greetingSettled = true;
+        console.log('[media-stream] greeting turn complete — now forwarding live caller audio, buffered frames:', pendingIn.length);
+        if (pendingIn.length) {
+          pendingIn.forEach((payload) => geminiSession.sendAudio(twilioPayloadToGeminiPcm16(payload)));
+          pendingIn = [];
+        }
+      },
       onError: (err) => {
         console.error('[media-stream] Gemini session error:', err.message);
         cleanup();
@@ -148,11 +158,6 @@ async function handleConnection(twilioWs) {
     geminiReady    = true;
     starting       = false;
     lastActivityAt = Date.now(); // starts the silence clock from session-open, giving the greeting a fair window
-
-    if (pendingIn.length) {
-      pendingIn.forEach((payload) => geminiSession.sendAudio(twilioPayloadToGeminiPcm16(payload)));
-      pendingIn = [];
-    }
 
     sessionTimer = setTimeout(() => {
       console.warn('[media-stream] max session duration reached, closing:', streamSid);
@@ -189,12 +194,18 @@ async function handleConnection(twilioWs) {
           console.log('[media-stream] first inbound frame, track:', msg.media.track, 'payload bytes (b64):', msg.media.payload.length);
         }
         if (inboundFrameCount % 100 === 0) {
-          console.log('[media-stream] inbound frames so far:', inboundFrameCount, 'geminiReady:', geminiReady);
+          console.log('[media-stream] inbound frames so far:', inboundFrameCount, 'geminiReady:', geminiReady, 'greetingSettled:', greetingSettled);
         }
-        if (geminiReady) {
+        if (geminiReady && greetingSettled) {
           geminiSession.sendAudio(twilioPayloadToGeminiPcm16(msg.media.payload));
-        } else if (starting) {
-          pendingIn.push(msg.media.payload); // arrived mid-setup — don't drop it
+        } else if (starting || (geminiReady && !greetingSettled)) {
+          // Buffered, not forwarded, until the greeting's first turn
+          // completes — forwarding live caller audio into an in-progress
+          // turn that hasn't produced any audio yet is exactly what let
+          // automatic VAD interrupt the greeting before it ever spoke,
+          // confirmed live: a real call's greeting was interrupted at the
+          // ~6s mark with zero audio ever generated for it.
+          pendingIn.push(msg.media.payload);
         }
         break;
 
