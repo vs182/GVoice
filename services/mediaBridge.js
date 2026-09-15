@@ -76,8 +76,7 @@ async function handleConnection(twilioWs) {
   let lastActivityAt = null; // last time Gemini actually produced audio
   let closed        = false;
 
-  // TEMPORARY instrumentation to locate a "connects fine, caller hears
-  // nothing" report — remove once the audio path is confirmed working.
+  // Counters for the one-line summary logged when the call ends.
   let inboundFrameCount  = 0;
   let geminiAudioChunks  = 0;
   let outboundFrameCount = 0;
@@ -128,7 +127,6 @@ async function handleConnection(twilioWs) {
       onAudio: (base64Pcm24k) => {
         geminiAudioChunks++;
         lastActivityAt = Date.now();
-        console.log('[media-stream] audio chunk from Gemini #', geminiAudioChunks, 'bytes:', Buffer.from(base64Pcm24k, 'base64').length);
         const mulawPayload = geminiPcm16ToTwilioPayload(base64Pcm24k);
         const mulawBuffer  = Buffer.from(mulawPayload, 'base64');
         chunkMulawInto20msFrames(mulawBuffer).forEach(sendToTwilio);
@@ -190,12 +188,6 @@ async function handleConnection(twilioWs) {
       case 'media':
         if (!msg.media?.payload) break;
         inboundFrameCount++;
-        if (inboundFrameCount === 1) {
-          console.log('[media-stream] first inbound frame, track:', msg.media.track, 'payload bytes (b64):', msg.media.payload.length);
-        }
-        if (inboundFrameCount % 100 === 0) {
-          console.log('[media-stream] inbound frames so far:', inboundFrameCount, 'geminiReady:', geminiReady, 'greetingSettled:', greetingSettled);
-        }
         if (geminiReady && greetingSettled) {
           geminiSession.sendAudio(twilioPayloadToGeminiPcm16(msg.media.payload));
         } else if (starting || (geminiReady && !greetingSettled)) {
