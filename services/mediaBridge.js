@@ -65,8 +65,18 @@ async function handleConnection(twilioWs) {
   let sessionTimer  = null;
   let closed        = false;
 
+  // TEMPORARY instrumentation to locate a "connects fine, caller hears
+  // nothing" report — remove once the audio path is confirmed working.
+  let inboundFrameCount  = 0;
+  let geminiAudioChunks  = 0;
+  let outboundFrameCount = 0;
+
   function sendToTwilio(base64MulawPayload) {
-    if (!streamSid || twilioWs.readyState !== twilioWs.OPEN) return;
+    outboundFrameCount++;
+    if (!streamSid || twilioWs.readyState !== twilioWs.OPEN) {
+      console.warn('[media-stream] DROPPED outbound frame — streamSid:', streamSid, 'wsState:', twilioWs.readyState);
+      return;
+    }
     twilioWs.send(JSON.stringify({
       event: 'media',
       streamSid,
@@ -104,6 +114,8 @@ async function handleConnection(twilioWs) {
     geminiSession = await openGeminiVoiceSession({
       systemInstruction: p.prompt || DEFAULT_SYSTEM_INSTRUCTION,
       onAudio: (base64Pcm24k) => {
+        geminiAudioChunks++;
+        console.log('[media-stream] audio chunk from Gemini #', geminiAudioChunks, 'bytes:', Buffer.from(base64Pcm24k, 'base64').length);
         const mulawPayload = geminiPcm16ToTwilioPayload(base64Pcm24k);
         const mulawBuffer  = Buffer.from(mulawPayload, 'base64');
         chunkMulawInto20msFrames(mulawBuffer).forEach(sendToTwilio);
@@ -149,6 +161,13 @@ async function handleConnection(twilioWs) {
 
       case 'media':
         if (!msg.media?.payload) break;
+        inboundFrameCount++;
+        if (inboundFrameCount === 1) {
+          console.log('[media-stream] first inbound frame, track:', msg.media.track, 'payload bytes (b64):', msg.media.payload.length);
+        }
+        if (inboundFrameCount % 100 === 0) {
+          console.log('[media-stream] inbound frames so far:', inboundFrameCount, 'geminiReady:', geminiReady);
+        }
         if (geminiReady) {
           geminiSession.sendAudio(twilioPayloadToGeminiPcm16(msg.media.payload));
         } else if (starting) {
@@ -157,7 +176,8 @@ async function handleConnection(twilioWs) {
         break;
 
       case 'stop':
-        console.log('[media-stream] call stopped, streamSid:', streamSid);
+        console.log('[media-stream] call stopped, streamSid:', streamSid,
+          '| totals — inbound frames:', inboundFrameCount, 'gemini audio chunks:', geminiAudioChunks, 'outbound frames:', outboundFrameCount);
         cleanup();
         break;
 

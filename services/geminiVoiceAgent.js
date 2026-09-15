@@ -68,18 +68,29 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
     callbacks: {
       onopen: () => console.log('[gemini] session opened'),
       onmessage: (message) => {
+        // TEMPORARY instrumentation to locate a "session opens, no audio
+        // ever comes back" report — logs every message shape so we can see
+        // whether Gemini is engaging with the call at all (setupComplete,
+        // turnComplete with no audio, etc.) before it's removed again.
         const content = message?.serverContent;
-        if (!content) return;
+        if (!content) {
+          console.log('[gemini] non-serverContent message:', JSON.stringify(message).slice(0, 300));
+          return;
+        }
 
         if (content.interrupted && typeof onInterrupted === 'function') {
           onInterrupted();
         }
 
         const parts = content.modelTurn?.parts ?? [];
-        for (const part of parts) {
-          if (part.inlineData?.data && typeof onAudio === 'function') {
-            onAudio(part.inlineData.data);
-          }
+        const audioParts = parts.filter((p) => p.inlineData?.data);
+        if (audioParts.length === 0) {
+          console.log('[gemini] serverContent with no audio — turnComplete:', content.turnComplete,
+            'generationComplete:', content.generationComplete, 'interrupted:', content.interrupted,
+            'partsCount:', parts.length, 'partTypes:', parts.map((p) => Object.keys(p)));
+        }
+        for (const part of audioParts) {
+          onAudio?.(part.inlineData.data);
         }
       },
       onerror: (err) => {
