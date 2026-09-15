@@ -105,6 +105,23 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
     },
   });
 
+  // Automatic VAD only ever REACTS to detected speech — it never speaks
+  // first. On a real call, the caller is waiting to hear the agent greet
+  // them, the same as any normal call; if nothing ever prompts a turn, the
+  // whole call can go by in silence even though audio is flowing into
+  // Gemini the entire time (confirmed live: a real 28s call sent 1425 real
+  // audio frames and never got a single serverContent message back).
+  // Kicking off one explicit turn here — safely after `session` exists,
+  // not inside onopen, which fires before this `await` resolves and would
+  // hit a temporal-dead-zone error referencing `session` early — covers
+  // that. sendRealtimeInput above still handles the rest of the
+  // conversation reactively once this first exchange completes.
+  try {
+    session.sendClientContent({ turns: 'The caller has just connected. Greet them warmly in one short sentence and ask how you can help.' });
+  } catch (err) {
+    console.warn('[gemini] initial greeting trigger failed:', err.message ?? err);
+  }
+
   return {
     sendAudio(base64Pcm16k) {
       if (closed) return;
