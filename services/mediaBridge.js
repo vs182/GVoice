@@ -153,6 +153,10 @@ async function handleConnection(twilioWs) {
         cleanup();
       },
       onClose: cleanup,
+      // The AI's own transfer_to_human_agent / end_call tools asking to hang
+      // up, once its goodbye turn has actually finished — see
+      // geminiVoiceAgent.js's CLOSE_AFTER_TURN_DELAY_MS.
+      onCloseRequested: cleanup,
     });
 
     if (closed) { geminiSession.close(); return; } // cleanup() ran while we were awaiting connect()

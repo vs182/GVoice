@@ -33,14 +33,29 @@
  * functionResponse by id, so handleToolCall() always responds — with an
  * error payload if the tool itself failed — never silently drops one.
  *
- * One extra tool is declared alongside whatever MCP provides:
- * transfer_to_human_agent. It isn't an MCP tool — MCP only exposes Zoho
- * Desk data, not Twilio call control — so it's handled locally instead of
- * being forwarded to mcpBridge.callTool(). Calling it signs a request (see
- * ./hmacAuth.js#signTransfer) and POSTs it back to the Catalyst server that
- * set up this call, asking it to REST-redirect the caller's live call into
- * that number's configured human ring group. Only declared when the
- * opts needed to do that (accountSid/callSid/webhookBaseUrl) are present.
+ * Two extra tools are declared alongside whatever MCP provides — neither is
+ * an MCP tool (MCP only exposes Zoho Desk data, not call control), so both
+ * are handled locally instead of being forwarded to mcpBridge.callTool():
+ *
+ *   transfer_to_human_agent — signs a request (see ./hmacAuth.js#signTransfer)
+ *     and POSTs it to the Catalyst server, asking whether any agent
+ *     configured for this number is actually *available* right now (real
+ *     presence, not just configured — see ztwilio's services/agentPresence.js).
+ *     If so, the Catalyst server records what to ring once this call ends
+ *     and this schedules the session to close after the model's next turn
+ *     completes (giving it room to say goodbye first) — Twilio's <Connect>
+ *     action fires on that close and does the actual ringing (a real,
+ *     documented mechanism; earlier versions of this REST-redirected the
+ *     live call directly, which isn't documented-safe for a call mid-Dial
+ *     or mid-Connect and reliably produced "an application error has
+ *     occurred"). If no one's available, nothing is scheduled — the
+ *     functionResponse tells the model to handle it conversationally
+ *     instead (e.g. offer a callback via its own ZohoDesk_createTask tool).
+ *
+ *   end_call — the model's own way to hang up once a conversation is
+ *     genuinely finished, rather than leaving the caller on an open line
+ *     indefinitely. Also just schedules a close-after-next-turn — never
+ *     closes mid-sentence.
  */
 
 import { GoogleGenAI, Modality } from '@google/genai';
@@ -51,12 +66,27 @@ const DEFAULT_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-live-preview
 const DEFAULT_VOICE = process.env.GEMINI_VOICE || 'Puck';
 const MCP_SERVER_URL = process.env.MCP_SERVER_URL || '';
 
+// Give the last turn's audio time to actually reach Twilio (and get played)
+// before the WebSocket that's carrying it closes — sendAudio() calls having
+// returned only means the bytes were handed off, not that they've arrived.
+const CLOSE_AFTER_TURN_DELAY_MS = 1200;
+
 const TRANSFER_TOOL_NAME = 'transfer_to_human_agent';
 const TRANSFER_TOOL_DECLARATION = {
   name: TRANSFER_TOOL_NAME,
-  description: 'Transfers the current call to a human support agent. Use this when the caller explicitly asks for a human, ' +
-    'the issue is outside what you can resolve, or per your escalation instructions. Say a brief, friendly hand-off line to ' +
-    'the caller BEFORE calling this tool — the call will be redirected shortly after it returns, so anything said after may not be heard.',
+  description: 'Checks whether a human agent is available and, if so, arranges to transfer the call to them once you finish ' +
+    'speaking. Use this when the caller explicitly asks for a human, the issue is outside what you can resolve, or per your ' +
+    'escalation instructions. The tool result tells you whether anyone was actually available — if yes, say a brief, friendly ' +
+    'hand-off line and nothing further; if no, apologize and offer another way to help (e.g. logging a callback request) instead.',
+  parameters: { type: 'object', properties: {}, required: [] },
+};
+
+const END_CALL_TOOL_NAME = 'end_call';
+const END_CALL_TOOL_DECLARATION = {
+  name: END_CALL_TOOL_NAME,
+  description: 'Ends the current call. Use this once the conversation is genuinely finished — you have resolved the issue or ' +
+    'the caller says they are done — and you have already said a proper goodbye. Do not call this mid-sentence; say your ' +
+    'goodbye first, in the same turn, then call this tool.',
   parameters: { type: 'object', properties: {}, required: [] },
 };
 
@@ -86,6 +116,11 @@ function getClient() {
  *   on a turn that hasn't produced any audio yet — see mediaBridge.js.
  * @param {(err: Error) => void} opts.onError
  * @param {() => void} [opts.onClose]
+ * @param {() => void} [opts.onCloseRequested] — the transfer/end-call tools'
+ *   way of asking to hang up, fired once shortly after the turn following
+ *   that tool call finishes (see CLOSE_AFTER_TURN_DELAY_MS) — callers
+ *   should treat this exactly like onClose (run cleanup, close the Twilio
+ *   WebSocket), just from a different trigger.
  * @param {string} [opts.accountSid] — needed only for transfer_to_human_agent
  * @param {string} [opts.callSid] — needed only for transfer_to_human_agent
  * @param {string} [opts.to] — the number the caller dialed; tells the
@@ -94,10 +129,16 @@ function getClient() {
  *   URL, so transfer_to_human_agent knows where to call back
  * @returns {Promise<{ sendAudio: (base64Pcm16k: string) => void, close: () => void }>}
  */
-export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onError, onClose, accountSid, callSid, to, webhookBaseUrl }) {
+export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onError, onClose, onCloseRequested, accountSid, callSid, to, webhookBaseUrl }) {
   const ai = getClient();
   let closed = false;
   const transferAvailable = !!(accountSid && callSid && webhookBaseUrl);
+
+  // Set by a transfer/end-call tool once it decides the session should wind
+  // down — checked after the NEXT turn completes (giving the model room to
+  // actually say its goodbye first) rather than closing the instant the
+  // tool call itself resolves, which could cut that goodbye off mid-word.
+  let closeAfterNextTurn = false;
 
   async function performTransferToHumanAgent() {
     try {
@@ -108,12 +149,21 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         body: JSON.stringify({ accountSid, callSid, to, ts: timestamp, sig: signature }),
       });
       const data = await res.json();
-      if (!data.success) return { error: data.message || 'Unable to transfer the call right now.' };
-      return { message: 'Transfer initiated — the caller will be connected to a human agent shortly. If you have not already said goodbye, do so now.' };
+      if (!data.success) return { error: data.message || 'Unable to check agent availability right now.' };
+      if (!data.agentsAvailable) {
+        return { agentsAvailable: false, message: 'No human agent is available right now. Do not end the call — apologize and offer another way to help, such as logging a callback request.' };
+      }
+      closeAfterNextTurn = true;
+      return { agentsAvailable: true, message: 'An agent is available. Say a brief, friendly goodbye now — the call will transfer right after this turn, so say nothing further after your goodbye.' };
     } catch (err) {
       console.error('[gemini] transfer_to_human_agent failed:', err.message ?? err);
       return { error: 'Unable to reach the transfer service.' };
     }
+  }
+
+  function performEndCall() {
+    closeAfterNextTurn = true;
+    return { message: 'Ending the call after this turn.' };
   }
 
   // A mutable reference `onmessage`'s toolCall handling closes over, rather
@@ -143,6 +193,9 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       if (call.name === TRANSFER_TOOL_NAME) {
         const response = await performTransferToHumanAgent();
         return { id: call.id, name: call.name, response };
+      }
+      if (call.name === END_CALL_TOOL_NAME) {
+        return { id: call.id, name: call.name, response: performEndCall() };
       }
       if (!mcpBridge) {
         // An MCP tool was declared but the bridge that serves it is gone
@@ -178,6 +231,7 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         const functionDeclarations = [
           ...(mcpBridge ? mcpBridge.functionDeclarations : []),
           ...(transferAvailable ? [TRANSFER_TOOL_DECLARATION] : []),
+          END_CALL_TOOL_DECLARATION,
         ];
         return functionDeclarations.length ? { tools: [{ functionDeclarations }] } : {};
       })(),
@@ -202,7 +256,15 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         for (const part of audioParts) {
           onAudio?.(part.inlineData.data);
         }
-        if (content.turnComplete) onTurnComplete?.();
+        if (content.turnComplete) {
+          onTurnComplete?.();
+          if (closeAfterNextTurn) {
+            closeAfterNextTurn = false;
+            setTimeout(() => {
+              if (!closed) onCloseRequested?.();
+            }, CLOSE_AFTER_TURN_DELAY_MS);
+          }
+        }
       },
       onerror: (err) => {
         console.error('[gemini] session error:', err?.message ?? err);
