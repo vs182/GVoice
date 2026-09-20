@@ -124,6 +124,10 @@ async function handleConnection(twilioWs) {
 
     geminiSession = await openGeminiVoiceSession({
       systemInstruction: p.prompt || DEFAULT_SYSTEM_INSTRUCTION,
+      accountSid: p.accountSid,
+      callSid: msg.start?.callSid,
+      to: p.to,
+      webhookBaseUrl: p.webhookBaseUrl,
       onAudio: (base64Pcm24k) => {
         geminiAudioChunks++;
         lastActivityAt = Date.now();

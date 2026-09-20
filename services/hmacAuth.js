@@ -28,6 +28,21 @@ export function sign(accountSid, timestamp) {
   return crypto.createHmac('sha256', getSecret()).update(`${accountSid}:${timestamp}`).digest('hex');
 }
 
+/**
+ * Signs (accountSid + callSid + timestamp) for the reverse direction — this
+ * service calling BACK into the Catalyst server to ask for a live call to
+ * be transferred (the AI agent's "transfer_to_human_agent" tool). A
+ * distinct scheme from sign()/verify() above, which authenticate the
+ * OUTBOUND Stream connection instead; its verify() counterpart is
+ * ztwilio's services/mediaStreamAuth.js#verifyTransferRequest — must stay
+ * byte-identical to that.
+ */
+export function signTransfer(accountSid, callSid) {
+  const timestamp = Date.now();
+  const signature = crypto.createHmac('sha256', getSecret()).update(`${accountSid}:${callSid}:${timestamp}`).digest('hex');
+  return { timestamp, signature };
+}
+
 export function verify(accountSid, timestamp, signature) {
   if (!accountSid || !timestamp || !signature) return false;
 

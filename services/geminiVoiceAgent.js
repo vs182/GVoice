@@ -32,14 +32,33 @@
  * (including audio) until every functionCall in it gets a matching
  * functionResponse by id, so handleToolCall() always responds — with an
  * error payload if the tool itself failed — never silently drops one.
+ *
+ * One extra tool is declared alongside whatever MCP provides:
+ * transfer_to_human_agent. It isn't an MCP tool — MCP only exposes Zoho
+ * Desk data, not Twilio call control — so it's handled locally instead of
+ * being forwarded to mcpBridge.callTool(). Calling it signs a request (see
+ * ./hmacAuth.js#signTransfer) and POSTs it back to the Catalyst server that
+ * set up this call, asking it to REST-redirect the caller's live call into
+ * that number's configured human ring group. Only declared when the
+ * opts needed to do that (accountSid/callSid/webhookBaseUrl) are present.
  */
 
 import { GoogleGenAI, Modality } from '@google/genai';
 import { connectMcpBridge } from './mcpBridge.js';
+import { signTransfer } from './hmacAuth.js';
 
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-live-preview';
 const DEFAULT_VOICE = process.env.GEMINI_VOICE || 'Puck';
 const MCP_SERVER_URL = process.env.MCP_SERVER_URL || '';
+
+const TRANSFER_TOOL_NAME = 'transfer_to_human_agent';
+const TRANSFER_TOOL_DECLARATION = {
+  name: TRANSFER_TOOL_NAME,
+  description: 'Transfers the current call to a human support agent. Use this when the caller explicitly asks for a human, ' +
+    'the issue is outside what you can resolve, or per your escalation instructions. Say a brief, friendly hand-off line to ' +
+    'the caller BEFORE calling this tool — the call will be redirected shortly after it returns, so anything said after may not be heard.',
+  parameters: { type: 'object', properties: {}, required: [] },
+};
 
 let _ai = null;
 function getClient() {
@@ -67,11 +86,35 @@ function getClient() {
  *   on a turn that hasn't produced any audio yet — see mediaBridge.js.
  * @param {(err: Error) => void} opts.onError
  * @param {() => void} [opts.onClose]
+ * @param {string} [opts.accountSid] — needed only for transfer_to_human_agent
+ * @param {string} [opts.callSid] — needed only for transfer_to_human_agent
+ * @param {string} [opts.to] — the number the caller dialed; tells the
+ *   backend which number's ring group to escalate to
+ * @param {string} [opts.webhookBaseUrl] — the Catalyst server's own base
+ *   URL, so transfer_to_human_agent knows where to call back
  * @returns {Promise<{ sendAudio: (base64Pcm16k: string) => void, close: () => void }>}
  */
-export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onError, onClose }) {
+export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onError, onClose, accountSid, callSid, to, webhookBaseUrl }) {
   const ai = getClient();
   let closed = false;
+  const transferAvailable = !!(accountSid && callSid && webhookBaseUrl);
+
+  async function performTransferToHumanAgent() {
+    try {
+      const { timestamp, signature } = signTransfer(accountSid, callSid);
+      const res = await fetch(webhookBaseUrl.replace(/\/$/, '') + '/api/calls/transfer-from-ai', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({ accountSid, callSid, to, ts: timestamp, sig: signature }),
+      });
+      const data = await res.json();
+      if (!data.success) return { error: data.message || 'Unable to transfer the call right now.' };
+      return { message: 'Transfer initiated — the caller will be connected to a human agent shortly. If you have not already said goodbye, do so now.' };
+    } catch (err) {
+      console.error('[gemini] transfer_to_human_agent failed:', err.message ?? err);
+      return { error: 'Unable to reach the transfer service.' };
+    }
+  }
 
   // A mutable reference `onmessage`'s toolCall handling closes over, rather
   // than the `session` const itself — `onmessage` is wired up as part of the
@@ -96,17 +139,17 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
     const calls = toolCall?.functionCalls ?? [];
     if (!calls.length || !liveSession) return;
 
-    if (!mcpBridge) {
-      // Tools were declared but the bridge that serves them is gone (or
-      // never connected) — every pending call still needs a response or
-      // the Live API blocks the turn (and audio) waiting on it forever.
-      liveSession.sendToolResponse({
-        functionResponses: calls.map((c) => ({ id: c.id, name: c.name, response: { error: 'Tool service unavailable.' } })),
-      });
-      return;
-    }
-
     const functionResponses = await Promise.all(calls.map(async (call) => {
+      if (call.name === TRANSFER_TOOL_NAME) {
+        const response = await performTransferToHumanAgent();
+        return { id: call.id, name: call.name, response };
+      }
+      if (!mcpBridge) {
+        // An MCP tool was declared but the bridge that serves it is gone
+        // (or never connected) — every pending call still needs a response
+        // or the Live API blocks the turn (and audio) waiting on it forever.
+        return { id: call.id, name: call.name, response: { error: 'Tool service unavailable.' } };
+      }
       try {
         const result = await mcpBridge.callTool(call.name, call.args);
         return { id: call.id, name: call.name, response: { result } };
@@ -131,9 +174,13 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: DEFAULT_VOICE } },
       },
-      ...(mcpBridge && mcpBridge.functionDeclarations.length
-        ? { tools: [{ functionDeclarations: mcpBridge.functionDeclarations }] }
-        : {}),
+      ...(() => {
+        const functionDeclarations = [
+          ...(mcpBridge ? mcpBridge.functionDeclarations : []),
+          ...(transferAvailable ? [TRANSFER_TOOL_DECLARATION] : []),
+        ];
+        return functionDeclarations.length ? { tools: [{ functionDeclarations }] } : {};
+      })(),
     },
     callbacks: {
       onopen: () => console.log('[gemini] session opened'),
