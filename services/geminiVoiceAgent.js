@@ -22,12 +22,24 @@
  * stream continuous audio without manual turn markers — exactly the "caller
  * talks, pauses, agent responds" shape a phone call needs, so there's no
  * custom VAD here.
+ *
+ * Tool calling: if MCP_SERVER_URL is set, this connects to that MCP server
+ * (see ./mcpBridge.js) and declares its tools to the Live session as
+ * `functionDeclarations` — Live API has no native MCP support, only plain
+ * function declarations, so the bridge module does that translation by
+ * hand. `message.toolCall` arrives as a distinct message type alongside
+ * `message.serverContent`, not inside it; the Live API blocks the turn
+ * (including audio) until every functionCall in it gets a matching
+ * functionResponse by id, so handleToolCall() always responds — with an
+ * error payload if the tool itself failed — never silently drops one.
  */
 
 import { GoogleGenAI, Modality } from '@google/genai';
+import { connectMcpBridge } from './mcpBridge.js';
 
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-live-preview';
 const DEFAULT_VOICE = process.env.GEMINI_VOICE || 'Puck';
+const MCP_SERVER_URL = process.env.MCP_SERVER_URL || '';
 
 let _ai = null;
 function getClient() {
@@ -61,6 +73,56 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
   const ai = getClient();
   let closed = false;
 
+  // A mutable reference `onmessage`'s toolCall handling closes over, rather
+  // than the `session` const itself — `onmessage` is wired up as part of the
+  // very call that produces `session`, so referencing that const directly
+  // from inside it would hit the same temporal-dead-zone trap the greeting
+  // trigger below already had to work around. This is assigned once the
+  // `await` resolves, further down.
+  let liveSession = null;
+
+  // Best-effort: an MCP server unreachable/misconfigured shouldn't block a
+  // phone call from connecting — it just proceeds without tools.
+  let mcpBridge = null;
+  if (MCP_SERVER_URL) {
+    try {
+      mcpBridge = await connectMcpBridge(MCP_SERVER_URL);
+    } catch (err) {
+      console.error('[mcp] failed to connect, continuing without tools:', err.message ?? err);
+    }
+  }
+
+  async function handleToolCall(toolCall) {
+    const calls = toolCall?.functionCalls ?? [];
+    if (!calls.length || !liveSession) return;
+
+    if (!mcpBridge) {
+      // Tools were declared but the bridge that serves them is gone (or
+      // never connected) — every pending call still needs a response or
+      // the Live API blocks the turn (and audio) waiting on it forever.
+      liveSession.sendToolResponse({
+        functionResponses: calls.map((c) => ({ id: c.id, name: c.name, response: { error: 'Tool service unavailable.' } })),
+      });
+      return;
+    }
+
+    const functionResponses = await Promise.all(calls.map(async (call) => {
+      try {
+        const result = await mcpBridge.callTool(call.name, call.args);
+        return { id: call.id, name: call.name, response: { result } };
+      } catch (err) {
+        console.error('[mcp] tool call failed:', call.name, err.message ?? err);
+        return { id: call.id, name: call.name, response: { error: err.message ?? String(err) } };
+      }
+    }));
+
+    try {
+      liveSession.sendToolResponse({ functionResponses });
+    } catch (err) {
+      console.warn('[gemini] sendToolResponse failed:', err.message ?? err);
+    }
+  }
+
   const session = await ai.live.connect({
     model: DEFAULT_MODEL,
     config: {
@@ -69,10 +131,18 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: DEFAULT_VOICE } },
       },
+      ...(mcpBridge && mcpBridge.functionDeclarations.length
+        ? { tools: [{ functionDeclarations: mcpBridge.functionDeclarations }] }
+        : {}),
     },
     callbacks: {
       onopen: () => console.log('[gemini] session opened'),
       onmessage: (message) => {
+        if (message?.toolCall) {
+          handleToolCall(message.toolCall).catch((err) => console.error('[mcp] tool call handling failed:', err.message ?? err));
+          return;
+        }
+
         const content = message?.serverContent;
         if (!content) return; // setupComplete, sessionResumptionUpdate, etc. — nothing to do
 
@@ -98,6 +168,7 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       },
     },
   });
+  liveSession = session;
 
   // Automatic VAD only ever REACTS to detected speech — it never speaks
   // first. On a real call, the caller is waiting to hear the agent greet
@@ -144,6 +215,7 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       if (closed) return;
       closed = true;
       try { session.close(); } catch (_) {}
+      if (mcpBridge) mcpBridge.close().catch(() => {});
     },
   };
 }
