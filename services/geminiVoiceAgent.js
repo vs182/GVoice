@@ -169,46 +169,6 @@ async function resolveDepartmentId(mcpBridge) {
   return cachedDepartmentId;
 }
 
-async function classifyForFollowUp(ai, transcriptText) {
-  const fallback = { needsFollowUp: false, queryName: '', taskDescription: '' };
-  if (!transcriptText.trim()) return fallback;
-  try {
-    const result = await ai.models.generateContent({
-      model: process.env.GEMINI_CLASSIFIER_MODEL || 'gemini-3.6-flash',
-      contents: [{
-        role: 'user',
-        parts: [{
-          text: 'Read this customer support phone call transcript between a caller and an AI support agent. Decide whether ' +
-            'it needs a human agent to follow up — e.g. an unresolved issue, an explicit escalation or callback request, a ' +
-            'promise to follow up, or anything urgent/priority. If yes, give a short topic label and a full, detailed ' +
-            'summary a human agent can act on without re-reading the transcript.\n\nTranscript:\n' + transcriptText,
-        }],
-      }],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'object',
-          properties: {
-            needsFollowUp: { type: 'boolean' },
-            queryName: { type: 'string', description: 'Short 2-5 word topic label, e.g. "Billing Refund Issue"' },
-            taskDescription: {
-              type: 'string',
-              description: 'Full call context for a human agent: what the caller needed, what was discussed/resolved, ' +
-                'what remains open, and what to do next.',
-            },
-          },
-          required: ['needsFollowUp'],
-        },
-      },
-    });
-    const text = result.text ?? result.candidates?.[0]?.content?.parts?.[0]?.text;
-    return text ? { ...fallback, ...JSON.parse(text) } : fallback;
-  } catch (err) {
-    console.error('[call-log] follow-up classification failed:', err.message ?? err);
-    return fallback;
-  }
-}
-
 /**
  * Opens one Live API session for one phone call.
  *
@@ -264,7 +224,14 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
   let currentTurnAgentText = '';
 
   async function finalizeCallLogging() {
-    if (!mcpBridge || !transcriptLog.length) return; // no Desk access, or nothing was ever said
+    if (!mcpBridge) {
+      console.warn('[call-log] no MCP bridge for this session, skipping Event/Task log');
+      return;
+    }
+    if (!transcriptLog.length) {
+      console.warn('[call-log] transcript is empty (nothing was transcribed), skipping Event/Task log');
+      return;
+    }
     const transcriptText = transcriptLog
       .map((t) => (t.role === 'caller' ? 'Caller: ' : 'Agent: ') + t.text.trim())
       .join('\n');
@@ -274,6 +241,7 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       try {
         const created = await mcpBridge.callTool('ZohoDesk_createContact', { body: { lastName: callerNumber, phone: callerNumber } });
         resolvedContactId = extractId(created);
+        if (!resolvedContactId) console.error('[call-log] createContact returned no extractable id:', JSON.stringify(created));
       } catch (err) {
         console.error('[call-log] createContact failed:', err.message ?? err);
       }
@@ -306,6 +274,8 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         },
       });
       eventId = extractId(eventResult);
+      if (!eventId) console.error('[call-log] createEvent returned no extractable id:', JSON.stringify(eventResult));
+      else console.log('[call-log] created Event', eventId, 'for', displayName);
     } catch (err) {
       console.error('[call-log] createEvent failed:', err.message ?? err);
     }
@@ -316,26 +286,31 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         path_variables: { eventId },
         body: { content: transcriptText.slice(0, 32000), contentType: 'plainText' },
       });
+      console.log('[call-log] added transcript comment to Event', eventId);
     } catch (err) {
       console.error('[call-log] createEventComment failed:', err.message ?? err);
     }
 
-    const classification = await classifyForFollowUp(ai, transcriptText);
-    if (classification.needsFollowUp) {
-      try {
-        await mcpBridge.callTool('ZohoDesk_createTask', {
-          body: {
-            subject: `${classification.queryName || 'Follow-up'} - ${agentName || 'AI Agent'} - ${displayName}`.slice(0, 300),
-            description: classification.taskDescription.slice(0, 65535),
-            contactId: resolvedContactId,
-            departmentId,
-            priority: 'High',
-            status: 'Not Started',
-          },
-        });
-      } catch (err) {
-        console.error('[call-log] createTask failed:', err.message ?? err);
-      }
+    // Every AI-handled call gets a Task too — no AI-judged "does this need
+    // follow-up" step anymore (that secondary Gemini call was unreliable
+    // under load — 503s from Google silently killed Task creation entirely,
+    // see git history) — so this always creates one, letting a human triage.
+    try {
+      const taskResult = await mcpBridge.callTool('ZohoDesk_createTask', {
+        body: {
+          subject: `Follow-up - ${agentName || 'AI Agent'} - ${displayName}`.slice(0, 300),
+          description: transcriptText.slice(0, 65535),
+          contactId: resolvedContactId,
+          departmentId,
+          priority: 'Normal',
+          status: 'Not Started',
+        },
+      });
+      const taskId = extractId(taskResult);
+      if (!taskId) console.error('[call-log] createTask returned no extractable id:', JSON.stringify(taskResult));
+      else console.log('[call-log] created Task', taskId, 'for', displayName);
+    } catch (err) {
+      console.error('[call-log] createTask failed:', err.message ?? err);
     }
   }
 
