@@ -84,11 +84,22 @@ const TRANSFER_TOOL_DECLARATION = {
 const END_CALL_TOOL_NAME = 'end_call';
 const END_CALL_TOOL_DECLARATION = {
   name: END_CALL_TOOL_NAME,
-  description: 'Ends the current call. Use this once the conversation is genuinely finished — you have resolved the issue or ' +
-    'the caller says they are done — and you have already said a proper goodbye. Do not call this mid-sentence; say your ' +
-    'goodbye first, in the same turn, then call this tool.',
+  description: 'Ends the current call. You MUST call this in the exact same turn as any goodbye ("goodbye", "have a good day", ' +
+    '"take care", etc.) — saying goodbye out loud without calling this function does NOT end the call, it just leaves the ' +
+    'caller sitting on an open line waiting. Never say a farewell word unless you are also calling this tool right after it ' +
+    'in that same turn. Use this once the conversation is genuinely finished — the issue is resolved or the caller says they ' +
+    'are done.',
   parameters: { type: 'object', properties: {}, required: [] },
 };
+
+// The model is instructed above to always pair a farewell with an end_call
+// tool call in the same turn, but observed live: it sometimes says "goodbye"
+// and just... keeps the call open anyway, leaving the caller hanging (worse,
+// the silence-recovery nudge in mediaBridge.js then prompts it to speak
+// again, undoing the goodbye entirely). This regex-based fallback treats a
+// spoken farewell as equivalent to an actual end_call invocation, so the
+// call still closes even when the model forgets the tool call itself.
+const FAREWELL_RE = /\bgoodbye\b|\bgood bye\b/i;
 
 let _ai = null;
 function getClient() {
@@ -163,7 +174,7 @@ async function classifyForFollowUp(ai, transcriptText) {
   if (!transcriptText.trim()) return fallback;
   try {
     const result = await ai.models.generateContent({
-      model: process.env.GEMINI_CLASSIFIER_MODEL || 'gemini-2.5-flash',
+      model: process.env.GEMINI_CLASSIFIER_MODEL || 'gemini-3.6-flash',
       contents: [{
         role: 'user',
         parts: [{
@@ -246,6 +257,11 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
     if (last && last.role === role) last.text += text;
     else transcriptLog.push({ role, text });
   }
+
+  // Accumulates just the CURRENT turn's agent speech, reset every
+  // turnComplete — used only for the farewell-detection fallback below, kept
+  // separate from transcriptLog (which merges across turn boundaries).
+  let currentTurnAgentText = '';
 
   async function finalizeCallLogging() {
     if (!mcpBridge || !transcriptLog.length) return; // no Desk access, or nothing was ever said
@@ -351,6 +367,7 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
   }
 
   function performEndCall() {
+    console.log('[gemini] end_call tool invoked by model');
     closeAfterNextTurn = true;
     return { message: 'Ending the call after this turn.' };
   }
@@ -442,7 +459,10 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         if (!content) return; // setupComplete, sessionResumptionUpdate, etc. — nothing to do
 
         if (content.inputTranscription?.text) appendTranscript('caller', content.inputTranscription.text);
-        if (content.outputTranscription?.text) appendTranscript('agent', content.outputTranscription.text);
+        if (content.outputTranscription?.text) {
+          appendTranscript('agent', content.outputTranscription.text);
+          currentTurnAgentText += content.outputTranscription.text;
+        }
 
         if (content.interrupted) {
           console.log('[gemini] turn interrupted (caller barge-in)');
@@ -455,6 +475,11 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
         }
         if (content.turnComplete) {
           onTurnComplete?.();
+          if (!closeAfterNextTurn && FAREWELL_RE.test(currentTurnAgentText)) {
+            console.log('[gemini] farewell detected without an end_call tool invocation — closing anyway');
+            closeAfterNextTurn = true;
+          }
+          currentTurnAgentText = '';
           if (closeAfterNextTurn) {
             closeAfterNextTurn = false;
             setTimeout(() => {
