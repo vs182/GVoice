@@ -128,6 +128,10 @@ async function handleConnection(twilioWs) {
       callSid: msg.start?.callSid,
       to: p.to,
       webhookBaseUrl: p.webhookBaseUrl,
+      agentName: p.agentName,
+      callerNumber: p.callerNumber,
+      contactId: p.contactId,
+      contactName: p.contactName,
       onAudio: (base64Pcm24k) => {
         geminiAudioChunks++;
         lastActivityAt = Date.now();

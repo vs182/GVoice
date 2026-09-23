@@ -100,6 +100,105 @@ function getClient() {
 }
 
 /**
+ * Post-call Desk logging — every AI-handled call gets a Zoho Desk Event (with
+ * the full transcript as a comment) and, if the transcript looks like it
+ * needs human follow-up, a Task too. This runs from close() below, which
+ * fires no matter how the call ended (caller hangup, the model's own
+ * end_call/transfer tools, an error, the max-session timeout) — deliberately
+ * NOT left to the model to remember to do via its own tool calls, since a
+ * caller who just hangs up gives the model no final turn to act in.
+ */
+
+// Zoho Desk API's create-record endpoints use inconsistent response
+// wrappings across MCP tools (and the MCP SDK itself sometimes carries the
+// payload as a JSON string in `content` rather than `structuredContent`) —
+// try every shape seen in practice rather than assuming one.
+function extractId(mcpResult) {
+  const direct = mcpResult?.structuredContent?.data?.id
+    || mcpResult?.structuredContent?.id
+    || mcpResult?.structuredContent?.data?.data?.id;
+  if (direct) return direct;
+  const text = mcpResult?.content?.[0]?.text;
+  if (text) {
+    try {
+      const parsed = JSON.parse(text);
+      return parsed?.id || parsed?.data?.id || null;
+    } catch (_) { /* not JSON */ }
+  }
+  return null;
+}
+
+function extractList(mcpResult) {
+  const list = mcpResult?.structuredContent?.data?.data || mcpResult?.structuredContent?.data;
+  if (Array.isArray(list)) return list;
+  const text = mcpResult?.content?.[0]?.text;
+  if (text) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed?.data)) return parsed.data;
+      if (Array.isArray(parsed)) return parsed;
+    } catch (_) { /* not JSON */ }
+  }
+  return [];
+}
+
+// Zoho Desk has no single "the" default department — cached per process
+// (this service is long-lived on Render, and the org's departments change
+// rarely) rather than refetched every call.
+let cachedDepartmentId = null;
+async function resolveDepartmentId(mcpBridge) {
+  if (cachedDepartmentId) return cachedDepartmentId;
+  try {
+    const result = await mcpBridge.callTool('ZohoDesk_getDepartments', { query_params: { isEnabled: true, limit: 1 } });
+    const first = extractList(result)[0];
+    if (first?.id) cachedDepartmentId = first.id;
+  } catch (err) {
+    console.error('[call-log] getDepartments failed:', err.message ?? err);
+  }
+  return cachedDepartmentId;
+}
+
+async function classifyForFollowUp(ai, transcriptText) {
+  const fallback = { needsFollowUp: false, queryName: '', taskDescription: '' };
+  if (!transcriptText.trim()) return fallback;
+  try {
+    const result = await ai.models.generateContent({
+      model: process.env.GEMINI_CLASSIFIER_MODEL || 'gemini-2.5-flash',
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: 'Read this customer support phone call transcript between a caller and an AI support agent. Decide whether ' +
+            'it needs a human agent to follow up — e.g. an unresolved issue, an explicit escalation or callback request, a ' +
+            'promise to follow up, or anything urgent/priority. If yes, give a short topic label and a full, detailed ' +
+            'summary a human agent can act on without re-reading the transcript.\n\nTranscript:\n' + transcriptText,
+        }],
+      }],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'object',
+          properties: {
+            needsFollowUp: { type: 'boolean' },
+            queryName: { type: 'string', description: 'Short 2-5 word topic label, e.g. "Billing Refund Issue"' },
+            taskDescription: {
+              type: 'string',
+              description: 'Full call context for a human agent: what the caller needed, what was discussed/resolved, ' +
+                'what remains open, and what to do next.',
+            },
+          },
+          required: ['needsFollowUp'],
+        },
+      },
+    });
+    const text = result.text ?? result.candidates?.[0]?.content?.parts?.[0]?.text;
+    return text ? { ...fallback, ...JSON.parse(text) } : fallback;
+  } catch (err) {
+    console.error('[call-log] follow-up classification failed:', err.message ?? err);
+    return fallback;
+  }
+}
+
+/**
  * Opens one Live API session for one phone call.
  *
  * @param {object} opts
@@ -129,10 +228,100 @@ function getClient() {
  *   URL, so transfer_to_human_agent knows where to call back
  * @returns {Promise<{ sendAudio: (base64Pcm16k: string) => void, close: () => void }>}
  */
-export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onError, onClose, onCloseRequested, accountSid, callSid, to, webhookBaseUrl }) {
+export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onError, onClose, onCloseRequested, accountSid, callSid, to, webhookBaseUrl, agentName, callerNumber, contactId, contactName }) {
   const ai = getClient();
   let closed = false;
   const transferAvailable = !!(accountSid && callSid && webhookBaseUrl);
+  const callStartedAt = Date.now();
+
+  // Running transcript, built from Gemini's own transcription of both sides
+  // — independent of anything the model does — so post-call Desk logging
+  // never depends on the model remembering to summarize itself. Consecutive
+  // chunks from the same speaker are merged; a chunk from the other speaker
+  // starts a new entry.
+  const transcriptLog = [];
+  function appendTranscript(role, text) {
+    if (!text) return;
+    const last = transcriptLog[transcriptLog.length - 1];
+    if (last && last.role === role) last.text += text;
+    else transcriptLog.push({ role, text });
+  }
+
+  async function finalizeCallLogging() {
+    if (!mcpBridge || !transcriptLog.length) return; // no Desk access, or nothing was ever said
+    const transcriptText = transcriptLog
+      .map((t) => (t.role === 'caller' ? 'Caller: ' : 'Agent: ') + t.text.trim())
+      .join('\n');
+
+    let resolvedContactId = contactId;
+    if (!resolvedContactId && callerNumber) {
+      try {
+        const created = await mcpBridge.callTool('ZohoDesk_createContact', { body: { lastName: callerNumber, phone: callerNumber } });
+        resolvedContactId = extractId(created);
+      } catch (err) {
+        console.error('[call-log] createContact failed:', err.message ?? err);
+      }
+    }
+    if (!resolvedContactId) {
+      console.warn('[call-log] no contact id available, skipping Event/Task log');
+      return;
+    }
+
+    const departmentId = await resolveDepartmentId(mcpBridge);
+    if (!departmentId) {
+      console.warn('[call-log] no department id available, skipping Event/Task log');
+      return;
+    }
+
+    const displayName = contactName || callerNumber || 'Unknown caller';
+    const durationSeconds = Math.max(1, Math.round((Date.now() - callStartedAt) / 1000));
+
+    let eventId = null;
+    try {
+      const eventResult = await mcpBridge.callTool('ZohoDesk_createEvent', {
+        body: {
+          subject: `Answered by ${agentName || 'AI Agent'} for ${displayName}`.slice(0, 300),
+          contactId: resolvedContactId,
+          departmentId,
+          startTime: new Date(callStartedAt).toISOString(),
+          duration: String(durationSeconds),
+          description: 'AI agent phone call — full transcript in comments.',
+          status: 'Completed',
+        },
+      });
+      eventId = extractId(eventResult);
+    } catch (err) {
+      console.error('[call-log] createEvent failed:', err.message ?? err);
+    }
+    if (!eventId) return;
+
+    try {
+      await mcpBridge.callTool('ZohoDesk_createEventComment', {
+        path_variables: { eventId },
+        body: { content: transcriptText.slice(0, 32000), contentType: 'plainText' },
+      });
+    } catch (err) {
+      console.error('[call-log] createEventComment failed:', err.message ?? err);
+    }
+
+    const classification = await classifyForFollowUp(ai, transcriptText);
+    if (classification.needsFollowUp) {
+      try {
+        await mcpBridge.callTool('ZohoDesk_createTask', {
+          body: {
+            subject: `${classification.queryName || 'Follow-up'} - ${agentName || 'AI Agent'} - ${displayName}`.slice(0, 300),
+            description: classification.taskDescription.slice(0, 65535),
+            contactId: resolvedContactId,
+            departmentId,
+            priority: 'High',
+            status: 'Not Started',
+          },
+        });
+      } catch (err) {
+        console.error('[call-log] createTask failed:', err.message ?? err);
+      }
+    }
+  }
 
   // Set by a transfer/end-call tool once it decides the session should wind
   // down — checked after the NEXT turn completes (giving the model room to
@@ -227,6 +416,11 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: DEFAULT_VOICE } },
       },
+      // Powers the post-call transcript (see finalizeCallLogging above) —
+      // independent of audio playback, so it works even if the call ends
+      // before the model ever calls a tool of its own.
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
       ...(() => {
         const functionDeclarations = [
           ...(mcpBridge ? mcpBridge.functionDeclarations : []),
@@ -246,6 +440,9 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
 
         const content = message?.serverContent;
         if (!content) return; // setupComplete, sessionResumptionUpdate, etc. — nothing to do
+
+        if (content.inputTranscription?.text) appendTranscript('caller', content.inputTranscription.text);
+        if (content.outputTranscription?.text) appendTranscript('agent', content.outputTranscription.text);
 
         if (content.interrupted) {
           console.log('[gemini] turn interrupted (caller barge-in)');
@@ -324,7 +521,11 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       if (closed) return;
       closed = true;
       try { session.close(); } catch (_) {}
-      if (mcpBridge) mcpBridge.close().catch(() => {});
+      // Fire-and-forget: audio is already done, so nothing is waiting on
+      // this, but it must finish using mcpBridge before closing it.
+      finalizeCallLogging()
+        .catch((err) => console.error('[call-log] finalize failed:', err.message ?? err))
+        .finally(() => { if (mcpBridge) mcpBridge.close().catch(() => {}); });
     },
   };
 }
