@@ -160,9 +160,15 @@ let cachedDepartmentId = null;
 async function resolveDepartmentId(mcpBridge) {
   if (cachedDepartmentId) return cachedDepartmentId;
   try {
-    const result = await mcpBridge.callTool('ZohoDesk_getDepartments', { query_params: { isEnabled: true, limit: 1 } });
+    // No isEnabled filter — this org's departments came back empty under
+    // that filter (confirmed live: "no department id available"), so just
+    // take whichever department exists first. Any real department is fine
+    // here; this is only ever used to satisfy Desk's required field on
+    // Event/Task creation, not to route the call anywhere.
+    const result = await mcpBridge.callTool('ZohoDesk_getDepartments', { query_params: { limit: 1 } });
     const first = extractList(result)[0];
     if (first?.id) cachedDepartmentId = first.id;
+    else console.error('[call-log] getDepartments returned no departments:', JSON.stringify(result));
   } catch (err) {
     console.error('[call-log] getDepartments failed:', err.message ?? err);
   }
