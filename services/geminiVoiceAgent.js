@@ -175,6 +175,22 @@ async function resolveDepartmentId(mcpBridge) {
   return cachedDepartmentId;
 }
 
+// Deterministic follow-up check — deliberately NOT a second Gemini call.
+// That was tried first and turned out unreliable in practice (503s under
+// load silently killed every Task); this has no external dependency, so it
+// can't fail. Matched only against the CALLER's own words, since escalation/
+// frustration signal comes from them, not the agent paraphrasing it back.
+const FRUSTRATION_RE = /\b(angry|frustrat(?:ed|ing)|annoyed|upset|unacceptable|ridiculous|terrible|awful|worst|fed up|sick of|not happy|unhappy|disappointed|furious)\b/i;
+const PRIORITY_RE = /\b(urgent|immediately|asap|escalate|escalation|priority|as soon as possible|right away|emergency|critical|manager|supervisor|within \d+\s*(?:hour|hours|minute|minutes|day|days)|call\s*(?:me\s*)?back|callback|follow[\s-]?up|complaint)\b/i;
+
+function checkNeedsFollowUp(transcriptLog) {
+  const callerText = transcriptLog.filter((t) => t.role === 'caller').map((t) => t.text).join(' ');
+  const labels = [];
+  if (FRUSTRATION_RE.test(callerText)) labels.push('Frustrated Caller');
+  if (PRIORITY_RE.test(callerText)) labels.push('Priority Request');
+  return { needsFollowUp: labels.length > 0, queryName: labels.join(' / ') };
+}
+
 /**
  * Opens one Live API session for one phone call.
  *
@@ -297,24 +313,29 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       console.error('[call-log] createEventComment failed:', err.message ?? err);
     }
 
-    // Every AI-handled call gets a Task too — no AI-judged "does this need
-    // follow-up" step anymore (that secondary Gemini call was unreliable
-    // under load — 503s from Google silently killed Task creation entirely,
-    // see git history) — so this always creates one, letting a human triage.
+    // Task only for calls that actually look like they need follow-up —
+    // priority/escalation language or caller frustration, checked
+    // deterministically (see checkNeedsFollowUp above), not via a second
+    // Gemini call (that was tried first and was unreliable under load).
+    const followUp = checkNeedsFollowUp(transcriptLog);
+    if (!followUp.needsFollowUp) {
+      console.log('[call-log] no priority/frustration signal detected, skipping Task');
+      return;
+    }
     try {
       const taskResult = await mcpBridge.callTool('ZohoDesk_createTask', {
         body: {
-          subject: `Follow-up - ${agentName || 'AI Agent'} - ${displayName}`.slice(0, 300),
+          subject: `${followUp.queryName} - ${agentName || 'AI Agent'} - ${displayName}`.slice(0, 300),
           description: transcriptText.slice(0, 65535),
           contactId: resolvedContactId,
           departmentId,
-          priority: 'Normal',
+          priority: 'High',
           status: 'Not Started',
         },
       });
       const taskId = extractId(taskResult);
       if (!taskId) console.error('[call-log] createTask returned no extractable id:', JSON.stringify(taskResult));
-      else console.log('[call-log] created Task', taskId, 'for', displayName);
+      else console.log('[call-log] created Task', taskId, 'for', displayName, '-', followUp.queryName);
     } catch (err) {
       console.error('[call-log] createTask failed:', err.message ?? err);
     }
