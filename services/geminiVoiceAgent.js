@@ -206,6 +206,9 @@ function checkNeedsFollowUp(transcriptLog) {
  *   typically only care about the FIRST one, to know when it's safe to
  *   start forwarding live caller audio without risking an interrupt firing
  *   on a turn that hasn't produced any audio yet — see mediaBridge.js.
+ * @param {() => void} [opts.onActivity] — fires on non-audio signs of life
+ *   (currently: a tool call starting) so a caller's own silence/stuck-session
+ *   watchdog doesn't mistake normal tool-call latency for a dead session.
  * @param {(err: Error) => void} opts.onError
  * @param {() => void} [opts.onClose]
  * @param {() => void} [opts.onCloseRequested] — the transfer/end-call tools'
@@ -221,7 +224,7 @@ function checkNeedsFollowUp(transcriptLog) {
  *   URL, so transfer_to_human_agent knows where to call back
  * @returns {Promise<{ sendAudio: (base64Pcm16k: string) => void, close: () => void }>}
  */
-export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onError, onClose, onCloseRequested, accountSid, callSid, to, webhookBaseUrl, agentName, callerNumber, contactId, contactName }) {
+export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInterrupted, onTurnComplete, onActivity, onError, onClose, onCloseRequested, accountSid, callSid, to, webhookBaseUrl, agentName, callerNumber, contactId, contactName }) {
   const ai = getClient();
   let closed = false;
   const transferAvailable = !!(accountSid && callSid && webhookBaseUrl);
@@ -453,6 +456,13 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       onopen: () => console.log('[gemini] session opened'),
       onmessage: (message) => {
         if (message?.toolCall) {
+          // A tool call (e.g. a Zoho Desk lookup) can legitimately take a
+          // few seconds with no audio output at all — without this, the
+          // silence-recovery watchdog in mediaBridge.js (which only sees
+          // audio as "activity") mistakes that wait for a stuck session and
+          // interrupts with a premature "are you still there?" right before
+          // the real answer would have arrived.
+          onActivity?.();
           handleToolCall(message.toolCall).catch((err) => console.error('[mcp] tool call handling failed:', err.message ?? err));
           return;
         }

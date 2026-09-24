@@ -143,6 +143,14 @@ async function handleConnection(twilioWs) {
         // Caller barged in — stop whatever Twilio still has queued for playback.
         clearTwilioPlayback();
       },
+      onActivity: () => {
+        // A tool call is in flight — real work is happening even though no
+        // audio has streamed yet, so this counts as activity too, not just
+        // onAudio. Without this, a Zoho Desk lookup taking a few seconds
+        // reads as a stuck session and triggers a premature recovery nudge
+        // right before the real answer would have arrived.
+        lastActivityAt = Date.now();
+      },
       onTurnComplete: () => {
         if (greetingSettled) return; // only care about the very first one
         greetingSettled = true;
