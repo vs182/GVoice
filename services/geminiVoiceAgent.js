@@ -248,6 +248,15 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
   // separate from transcriptLog (which merges across turn boundaries).
   let currentTurnAgentText = '';
 
+  // How many tool calls this session currently has outstanding (awaiting a
+  // functionResponse). mediaBridge.js's silence watchdog checks this before
+  // nudging — sending sendClientContent while a functionCall is still
+  // unresolved doesn't error, but the Live API queues it behind the eventual
+  // tool response, so the nudge and the real answer land back-to-back and
+  // read as a confused double-reply. A single counter (not a boolean) because
+  // one model turn can issue several tool calls at once (Promise.all above).
+  let toolCallsInFlight = 0;
+
   async function finalizeCallLogging() {
     if (!mcpBridge) {
       console.warn('[call-log] no MCP bridge for this session, skipping Event/Task log');
@@ -461,16 +470,33 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
           // silence-recovery watchdog in mediaBridge.js (which only sees
           // audio as "activity") mistakes that wait for a stuck session and
           // interrupts with a premature "are you still there?" right before
-          // the real answer would have arrived.
+          // the real answer would have arrived. toolCallsInFlight (cleared in
+          // the finally below) covers the tool call's FULL duration, not just
+          // its start — a slow multi-step lookup can easily outlast one nudge
+          // window on its own.
           onActivity?.();
-          handleToolCall(message.toolCall).catch((err) => console.error('[mcp] tool call handling failed:', err.message ?? err));
+          toolCallsInFlight++;
+          handleToolCall(message.toolCall)
+            .catch((err) => console.error('[mcp] tool call handling failed:', err.message ?? err))
+            .finally(() => { toolCallsInFlight--; });
           return;
         }
 
         const content = message?.serverContent;
         if (!content) return; // setupComplete, sessionResumptionUpdate, etc. — nothing to do
 
-        if (content.inputTranscription?.text) appendTranscript('caller', content.inputTranscription.text);
+        if (content.inputTranscription?.text) {
+          appendTranscript('caller', content.inputTranscription.text);
+          // The caller is actively speaking right now — Gemini only ever
+          // transcribes detected speech, never silence/comfort noise, so
+          // this is a true liveness signal, not just "a frame arrived."
+          // Without this, a caller mid-sentence with no output yet (normal:
+          // the model hasn't finished composing a reply) reads as dead air
+          // to the watchdog and gets talked over by "are you still there?"
+          // — confirmed as the actual cause of that live report, not a
+          // generic latency issue.
+          onActivity?.();
+        }
         if (content.outputTranscription?.text) {
           appendTranscript('agent', content.outputTranscription.text);
           currentTurnAgentText += content.outputTranscription.text;
@@ -553,6 +579,11 @@ export async function openGeminiVoiceSession({ systemInstruction, onAudio, onInt
       } catch (err) {
         console.warn('[gemini] sendNudge failed:', err.message ?? err);
       }
+    },
+    // Lets mediaBridge.js's watchdog hold off nudging while a tool call is
+    // still unresolved — see toolCallsInFlight above.
+    isToolCallPending() {
+      return toolCallsInFlight > 0;
     },
     close() {
       if (closed) return;

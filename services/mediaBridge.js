@@ -184,6 +184,15 @@ async function handleConnection(twilioWs) {
 
     watchdogTimer = setInterval(() => {
       if (closed || !lastActivityAt) return;
+      if (geminiSession.isToolCallPending()) {
+        // A tool call (e.g. a multi-step Zoho Desk lookup) is still
+        // unresolved — treat the whole wait as activity rather than risk a
+        // nudge landing mid-blocked-turn, which the Live API queues behind
+        // the eventual tool response instead of rejecting, producing a
+        // confusing stacked reply once both finally arrive.
+        lastActivityAt = Date.now();
+        return;
+      }
       const silentFor = Date.now() - lastActivityAt;
       if (silentFor >= SILENCE_NUDGE_MS) {
         console.warn('[media-stream] no Gemini activity for', silentFor, 'ms — sending recovery nudge, streamSid:', streamSid);
